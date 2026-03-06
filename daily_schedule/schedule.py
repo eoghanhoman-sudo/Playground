@@ -1,183 +1,177 @@
 #!/usr/bin/env python3
 """
-Daily Schedule Automation
-=========================
-Runs by 7am to organise your day using:
-  - Microsoft Outlook (via Graph API)  → today's meetings
-  - Todoist (REST API)                 → task prioritisation
-  - Claude API (claude-opus-4-6)       → intelligent schedule + priorities
+Personal Daily Organiser
+========================
+Runs by 7am to help you plan your day using:
+  - Apple Calendar  (iCloud CalDAV → VEVENT)
+  - Apple Reminders (iCloud CalDAV → VTODO)
+  - Claude API      (claude-opus-4-6) → personalised plan
 
-Setup: see .env.example for required credentials.
-Cron example (runs at 6:45am daily):
-  45 6 * * 1-5 cd /path/to/daily_schedule && python schedule.py
+Setup: copy .env.example → .env and fill in your details.
+
+Cron example (runs at 6:45am every morning):
+  45 6 * * * cd /path/to/daily_schedule && python schedule.py
 """
 
 import os
 import sys
-import json
 import datetime
-import threading
 from zoneinfo import ZoneInfo
 
 import anthropic
-import requests
-import msal
+import caldav
+from icalendar import Calendar as iCal
 from dotenv import load_dotenv
 
 load_dotenv()
 
 # ---------------------------------------------------------------------------
-# Configuration (set via .env or environment variables)
+# Config
 # ---------------------------------------------------------------------------
 
-ANTHROPIC_API_KEY   = os.getenv("ANTHROPIC_API_KEY", "")
-TODOIST_API_TOKEN   = os.getenv("TODOIST_API_TOKEN", "")
-AZURE_CLIENT_ID     = os.getenv("AZURE_CLIENT_ID", "")
-AZURE_TENANT_ID     = os.getenv("AZURE_TENANT_ID", "common")
+ANTHROPIC_API_KEY  = os.getenv("ANTHROPIC_API_KEY", "")
+APPLE_ID           = os.getenv("APPLE_ID", "")            # your iCloud email
+APPLE_APP_PASSWORD = os.getenv("APPLE_APP_PASSWORD", "")  # app-specific password
 
-# Your local timezone, e.g. "Europe/London", "America/New_York"
-TIMEZONE            = os.getenv("TIMEZONE", "Europe/London")
+# Your timezone (IANA format)
+TIMEZONE           = os.getenv("TIMEZONE", "Europe/London")
 
-# How many minutes your door-to-desk commute takes
-COMMUTE_MINUTES     = int(os.getenv("COMMUTE_MINUTES", "30"))
+# How long your commute takes (minutes)
+COMMUTE_MINUTES    = int(os.getenv("COMMUTE_MINUTES", "30"))
 
-# Optional: a note about your working situation, e.g. "hybrid - Tue/Thu in office"
-WORKING_PATTERN     = os.getenv("WORKING_PATTERN", "")
+# You leave home at this time each morning
+DEPARTURE_TIME     = os.getenv("DEPARTURE_TIME", "07:00")
 
-# Where to persist the MS auth token between runs (avoids re-login every day)
-TOKEN_CACHE_FILE    = os.path.expanduser("~/.daily_schedule_ms_cache.json")
+# Optional: comma-separated Apple Calendar names to include (empty = all)
+# e.g. "Personal,Family,Health"
+CALENDAR_FILTER    = os.getenv("CALENDAR_FILTER", "")
 
-GRAPH_ENDPOINT = "https://graph.microsoft.com/v1.0"
-GRAPH_SCOPES   = ["Calendars.Read", "User.Read"]
+ICLOUD_URL = "https://caldav.icloud.com"
 
 
 # ---------------------------------------------------------------------------
-# Microsoft Graph – Outlook calendar
+# iCloud connection
 # ---------------------------------------------------------------------------
 
-def _load_token_cache() -> msal.SerializableTokenCache:
-    cache = msal.SerializableTokenCache()
-    if os.path.exists(TOKEN_CACHE_FILE):
-        with open(TOKEN_CACHE_FILE) as f:
-            cache.deserialize(f.read())
-    return cache
-
-
-def _save_token_cache(cache: msal.SerializableTokenCache) -> None:
-    if cache.has_state_changed:
-        with open(TOKEN_CACHE_FILE, "w") as f:
-            f.write(cache.serialize())
-
-
-def get_ms_access_token() -> str:
-    """
-    Returns a valid Microsoft Graph access token.
-    Uses cached tokens when available; falls back to the device-code flow
-    (opens a short browser login) when a fresh grant is needed.
-    """
-    if not AZURE_CLIENT_ID:
+def connect_icloud() -> caldav.Principal:
+    if not APPLE_ID or not APPLE_APP_PASSWORD:
         raise EnvironmentError(
-            "AZURE_CLIENT_ID is not set. "
-            "Register an app in Azure Portal → App Registrations and add it to .env"
+            "APPLE_ID and APPLE_APP_PASSWORD must be set. "
+            "Generate an app-specific password at appleid.apple.com → Security."
         )
+    client = caldav.DAVClient(
+        url=ICLOUD_URL,
+        username=APPLE_ID,
+        password=APPLE_APP_PASSWORD,
+    )
+    return client.principal()
 
-    cache = _load_token_cache()
-    app = msal.PublicClientApplication(
-        AZURE_CLIENT_ID,
-        authority=f"https://login.microsoftonline.com/{AZURE_TENANT_ID}",
-        token_cache=cache,
+
+# ---------------------------------------------------------------------------
+# Apple Calendar – events
+# ---------------------------------------------------------------------------
+
+def get_apple_events(principal: caldav.Principal) -> list[dict]:
+    """
+    Fetch today's timed events from all (or filtered) Apple Calendars.
+    iCloud exposes both Calendar and Reminders as CalDAV objects;
+    we only want VEVENT components here.
+    """
+    tz    = ZoneInfo(TIMEZONE)
+    today = datetime.date.today()
+    start = datetime.datetime.combine(today, datetime.time.min, tzinfo=tz)
+    end   = datetime.datetime.combine(today, datetime.time.max, tzinfo=tz)
+
+    filter_names = (
+        {n.strip() for n in CALENDAR_FILTER.split(",") if n.strip()}
+        if CALENDAR_FILTER else set()
     )
 
-    # Try silent refresh first (uses cached refresh token)
-    accounts = app.get_accounts()
-    if accounts:
-        result = app.acquire_token_silent(GRAPH_SCOPES, account=accounts[0])
-        if result and "access_token" in result:
-            _save_token_cache(cache)
-            return result["access_token"]
+    events = []
+    for cal in principal.calendars():
+        cal_name = cal.name or ""
+        if filter_names and cal_name not in filter_names:
+            continue
 
-    # Interactive device-code flow – user opens browser once, then it's cached
-    flow = app.initiate_device_flow(scopes=GRAPH_SCOPES)
-    if "user_code" not in flow:
-        raise Exception(f"Failed to start device flow: {flow.get('error_description')}")
+        try:
+            raw_events = cal.date_search(start=start, end=end, expand=True)
+        except Exception:
+            # Some iCloud pseudo-calendars (Reminders lists, etc.) reject date_search
+            continue
 
-    print("\n── Microsoft Login Required ─────────────────────────────────")
-    print(flow["message"])
-    print("─────────────────────────────────────────────────────────────\n")
+        for ev in raw_events:
+            try:
+                parsed = iCal.from_ical(ev.data)
+            except Exception:
+                continue
 
-    result = app.acquire_token_by_device_flow(flow)
-    if "access_token" not in result:
-        raise Exception(f"Authentication failed: {result.get('error_description')}")
+            for component in parsed.walk():
+                if component.name != "VEVENT":
+                    continue
 
-    _save_token_cache(cache)
-    return result["access_token"]
+                dtstart = component.get("DTSTART")
+                dtend   = component.get("DTEND")
+                if dtstart is None:
+                    continue
+
+                start_val = dtstart.dt
+                end_val   = dtend.dt if dtend else start_val
+
+                # All-day events are date objects; timed events are datetimes
+                is_all_day = isinstance(start_val, datetime.date) and not isinstance(
+                    start_val, datetime.datetime
+                )
+
+                if not is_all_day:
+                    # Normalise to local tz
+                    if start_val.tzinfo is None:
+                        start_val = start_val.replace(tzinfo=tz)
+                    else:
+                        start_val = start_val.astimezone(tz)
+                    if end_val.tzinfo is None:
+                        end_val = end_val.replace(tzinfo=tz)
+                    else:
+                        end_val = end_val.astimezone(tz)
+
+                events.append({
+                    "summary":     str(component.get("SUMMARY", "(No title)")),
+                    "start":       start_val,
+                    "end":         end_val,
+                    "location":    str(component.get("LOCATION", "") or "").strip(),
+                    "description": str(component.get("DESCRIPTION", "") or "").strip()[:150],
+                    "all_day":     is_all_day,
+                    "calendar":    cal_name,
+                })
+
+    # Sort by start time; all-day events first
+    events.sort(key=lambda e: (
+        0 if e["all_day"] else 1,
+        e["start"] if not e["all_day"] else datetime.datetime.min,
+    ))
+    return events
 
 
-def get_outlook_events() -> list[dict]:
-    """Fetch calendar events for today from Microsoft Graph."""
-    token = get_ms_access_token()
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Prefer": f'outlook.timezone="{TIMEZONE}"',
-    }
-
-    tz        = ZoneInfo(TIMEZONE)
-    today     = datetime.date.today()
-    start_dt  = datetime.datetime.combine(today, datetime.time.min, tzinfo=tz)
-    end_dt    = datetime.datetime.combine(today, datetime.time.max, tzinfo=tz)
-
-    resp = requests.get(
-        f"{GRAPH_ENDPOINT}/me/calendarView",
-        headers=headers,
-        params={
-            "$select": (
-                "subject,start,end,location,bodyPreview,"
-                "isOnlineMeeting,showAs,sensitivity"
-            ),
-            "startDateTime": start_dt.isoformat(),
-            "endDateTime":   end_dt.isoformat(),
-            "$orderby":      "start/dateTime",
-            "$top":          "50",
-        },
-        timeout=15,
-    )
-    resp.raise_for_status()
-    return resp.json().get("value", [])
-
-
-def format_outlook_events(events: list[dict]) -> str:
+def format_events(events: list[dict]) -> str:
     if not events:
-        return "No meetings scheduled today."
+        return "Nothing in the calendar today."
 
     lines = []
     for ev in events:
-        raw_start = ev["start"].get("dateTime", ev["start"].get("date", ""))
-        raw_end   = ev["end"].get("dateTime",   ev["end"].get("date",   ""))
-
-        if "T" in raw_start:
-            # Graph returns local time because of the Prefer header
-            start_dt = datetime.datetime.fromisoformat(raw_start)
-            end_dt   = datetime.datetime.fromisoformat(raw_end)
-            duration = int((end_dt - start_dt).total_seconds() / 60)
-            time_str = f"{start_dt.strftime('%H:%M')}–{end_dt.strftime('%H:%M')} ({duration} min)"
-        else:
+        if ev["all_day"]:
             time_str = "All day"
+        else:
+            s = ev["start"]
+            e = ev["end"]
+            dur = int((e - s).total_seconds() / 60)
+            time_str = f"{s.strftime('%H:%M')}–{e.strftime('%H:%M')} ({dur} min)"
 
-        location = ev.get("location", {}).get("displayName", "").strip()
-        online   = ev.get("isOnlineMeeting", False)
-        show_as  = ev.get("showAs", "busy")          # free | tentative | busy | oof | workingElsewhere
-        subject  = ev.get("subject", "(No title)")
-        preview  = (ev.get("bodyPreview") or "").strip()[:120]
-
-        line = f"• {time_str}  {subject}"
-        if online:
-            line += " [Online]"
-        elif location:
-            line += f" @ {location}"
-        if show_as == "tentative":
-            line += " ⚠ Tentative"
-        if preview:
-            line += f"\n  └ {preview}"
+        line = f"• {time_str}  {ev['summary']}"
+        if ev["location"]:
+            line += f"  📍 {ev['location']}"
+        if ev["calendar"]:
+            line += f"  [{ev['calendar']}]"
+        if ev["description"]:
+            line += f"\n  └ {ev['description']}"
 
         lines.append(line)
 
@@ -185,105 +179,133 @@ def format_outlook_events(events: list[dict]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Todoist
+# Apple Reminders – todos
 # ---------------------------------------------------------------------------
 
-def get_todoist_tasks() -> list[dict]:
-    """Fetch tasks due today or overdue from Todoist."""
-    if not TODOIST_API_TOKEN:
-        raise EnvironmentError("TODOIST_API_TOKEN is not set.")
+def get_apple_reminders(principal: caldav.Principal) -> list[dict]:
+    """
+    Fetch incomplete reminders that are due today or overdue.
+    Reminders appear as VTODO components in iCloud CalDAV.
+    """
+    tz    = ZoneInfo(TIMEZONE)
+    today = datetime.date.today()
 
-    resp = requests.get(
-        "https://api.todoist.com/rest/v2/tasks",
-        headers={"Authorization": f"Bearer {TODOIST_API_TOKEN}"},
-        params={"filter": "today | overdue"},
-        timeout=10,
-    )
-    resp.raise_for_status()
-    return resp.json()
+    reminders = []
+    for cal in principal.calendars():
+        try:
+            todos = cal.todos(include_completed=False)
+        except Exception:
+            continue
+
+        for todo in todos:
+            try:
+                parsed = iCal.from_ical(todo.data)
+            except Exception:
+                continue
+
+            for component in parsed.walk():
+                if component.name != "VTODO":
+                    continue
+
+                due_prop = component.get("DUE") or component.get("DTSTART")
+                if due_prop is None:
+                    continue
+
+                due_val = due_prop.dt
+                due_date = due_val if isinstance(due_val, datetime.date) and not isinstance(
+                    due_val, datetime.datetime
+                ) else due_val.date() if isinstance(due_val, datetime.datetime) else due_val
+
+                if due_date > today:
+                    continue  # Future reminder, skip
+
+                summary  = str(component.get("SUMMARY", "(No title)"))
+                priority = int(component.get("PRIORITY", 0) or 0)
+                # iCal priority: 1–4 high, 5 medium, 6–9 low, 0 undefined
+                overdue  = due_date < today
+
+                reminders.append({
+                    "summary":  summary,
+                    "due_date": due_date,
+                    "priority": priority,
+                    "overdue":  overdue,
+                    "calendar": cal.name or "",
+                })
+
+    # Sort: overdue first, then by priority (1 = highest)
+    reminders.sort(key=lambda r: (not r["overdue"], r["priority"] if r["priority"] else 99))
+    return reminders
 
 
-def format_todoist_tasks(tasks: list[dict]) -> str:
-    if not tasks:
-        return "No tasks due today."
+def format_reminders(reminders: list[dict]) -> str:
+    if not reminders:
+        return "No reminders due today."
 
-    priority_label = {4: "🔴 P1", 3: "🟠 P2", 2: "🟡 P3", 1: "⬜ P4"}
-
-    # Sort: highest priority first, then by due time
-    def sort_key(t):
-        p = -(t.get("priority", 1))
-        due = t.get("due") or {}
-        time_str = due.get("datetime") or due.get("date") or "9999"
-        return (p, time_str)
-
-    sorted_tasks = sorted(tasks, key=sort_key)
     lines = []
-    for task in sorted_tasks:
-        p     = task.get("priority", 1)
-        label = priority_label.get(p, "⬜")
-        due   = task.get("due") or {}
-        due_time = ""
-        if due.get("datetime"):
-            dt = datetime.datetime.fromisoformat(due["datetime"].replace("Z", "+00:00"))
-            due_time = f" [due {dt.strftime('%H:%M')}]"
-        elif due.get("date"):
-            if due["date"] < str(datetime.date.today()):
-                due_time = f" [OVERDUE: {due['date']}]"
-
-        lines.append(f"{label} {task['content']}{due_time}")
+    for r in reminders:
+        prefix = "🔴 OVERDUE" if r["overdue"] else "📌"
+        due_str = f" [{r['due_date']}]" if r["overdue"] else ""
+        lines.append(f"{prefix}  {r['summary']}{due_str}")
 
     return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
-# Claude – schedule generation
+# Claude – personal day planner
 # ---------------------------------------------------------------------------
 
-def generate_schedule(events_text: str, tasks_text: str) -> None:
-    """Stream a Claude-generated daily schedule to stdout."""
+def generate_plan(events_text: str, reminders_text: str) -> None:
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-    tz      = ZoneInfo(TIMEZONE)
-    now     = datetime.datetime.now(tz)
-    today   = now.strftime("%A, %d %B %Y")
+    tz       = ZoneInfo(TIMEZONE)
+    now      = datetime.datetime.now(tz)
+    today    = now.strftime("%A, %d %B %Y")
     cur_time = now.strftime("%H:%M")
 
-    pattern_note = f"\nMy working pattern: {WORKING_PATTERN}" if WORKING_PATTERN else ""
+    # Work out arrival time from departure + commute
+    dep_h, dep_m = map(int, DEPARTURE_TIME.split(":"))
+    dep_dt  = now.replace(hour=dep_h, minute=dep_m, second=0, microsecond=0)
+    arr_dt  = dep_dt + datetime.timedelta(minutes=COMMUTE_MINUTES)
+    arrival = arr_dt.strftime("%H:%M")
 
-    prompt = f"""Today is {today}. Current time: {cur_time} ({TIMEZONE}).{pattern_note}
-My commute door-to-desk takes approximately {COMMUTE_MINUTES} minutes.
+    prompt = f"""Today is {today}. Current time: {cur_time} ({TIMEZONE}).
 
-━━━ OUTLOOK CALENDAR – TODAY ━━━
+I leave home at {DEPARTURE_TIME} each morning and arrive after a {COMMUTE_MINUTES}-minute commute (arriving ~{arrival}).
+
+━━━ APPLE CALENDAR – TODAY ━━━
 {events_text}
 
-━━━ TODOIST – DUE TODAY / OVERDUE ━━━
-{tasks_text}
+━━━ APPLE REMINDERS – DUE TODAY / OVERDUE ━━━
+{reminders_text}
 
-Please produce my daily organiser. Structure it exactly as follows:
+You are my personal daily organiser. Focus entirely on my personal life — \
+not work tasks, but things like health, family, social plans, errands, personal goals, \
+and making sure I actually enjoy my day.
 
-## Day at a Glance
-A 2-3 sentence overview of what today looks like (meeting load, available focus time, key pressure points).
+Please structure your response exactly like this:
 
-## Commute & Arrival
-Based on the first in-person commitment (if any), what time should I leave home?
-If everything is online or there are no meetings, note that I have flexibility.
+## Morning Snapshot
+A warm, brief (2–3 sentence) summary of today. How full is the day? \
+What's the overall feel of it?
 
-## Time-Blocked Schedule
-A realistic hour-by-hour plan from morning until end of day.
-Include:
-- Buffer time between meetings (at least 5 min)
-- Suggested focus blocks for deep work
-- Lunch (flag if a meeting is cutting into it)
-- Where to slot the Todoist tasks
+## Today's Plan
+A practical time-blocked plan from when I arrive (~{arrival}) through the evening. \
+Cover:
+- All calendar events with natural buffers before/after
+- Sensible spots for any reminders/errands
+- Meal times (flag if an event clashes with lunch or dinner)
+- Some downtime or personal time if the day allows
 
-## Top 3 Priorities
-The three most important things I must get done today, with a one-line reason each.
+## Don't Forget
+The top 3 things I absolutely must not let slip today, each with a one-liner on why.
 
-## Flags & Watch-outs
-Any conflicts, tight transitions, overdue tasks that need attention, or things I should prepare in advance.
+## Personal Notes
+Any gentle observations: is the day overloaded? Is there something worth doing for \
+myself (exercise, an early night, time with someone)? Flag any overdue reminders \
+that deserve attention this morning before the day kicks off.
 """
 
-    header = f"  DAILY ORGANISER – {today}  "
+    header = f"  YOUR DAY – {today}  "
     bar    = "─" * len(header)
 
     print(f"\n┌{bar}┐")
@@ -292,7 +314,7 @@ Any conflicts, tight transitions, overdue tasks that need attention, or things I
 
     with client.messages.stream(
         model="claude-opus-4-6",
-        max_tokens=2048,
+        max_tokens=2000,
         thinking={"type": "adaptive"},
         messages=[{"role": "user", "content": prompt}],
     ) as stream:
@@ -307,58 +329,45 @@ Any conflicts, tight transitions, overdue tasks that need attention, or things I
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    print("🗓  Fetching your day …\n")
-
-    errors = []
-
-    # -- Outlook --
-    events_text = ""
-    try:
-        print("  → Outlook: connecting …")
-        events = get_outlook_events()
-        events_text = format_outlook_events(events)
-        print(f"  → Outlook: {len(events)} event(s) found")
-    except EnvironmentError as exc:
-        msg = f"Outlook skipped – {exc}"
-        print(f"  ⚠  {msg}")
-        events_text = f"[{msg}]"
-        errors.append(msg)
-    except Exception as exc:
-        msg = f"Outlook error – {exc}"
-        print(f"  ⚠  {msg}")
-        events_text = "[Calendar unavailable]"
-        errors.append(msg)
-
-    # -- Todoist --
-    tasks_text = ""
-    try:
-        print("  → Todoist: fetching tasks …")
-        tasks = get_todoist_tasks()
-        tasks_text = format_todoist_tasks(tasks)
-        print(f"  → Todoist: {len(tasks)} task(s) found")
-    except EnvironmentError as exc:
-        msg = f"Todoist skipped – {exc}"
-        print(f"  ⚠  {msg}")
-        tasks_text = f"[{msg}]"
-        errors.append(msg)
-    except Exception as exc:
-        msg = f"Todoist error – {exc}"
-        print(f"  ⚠  {msg}")
-        tasks_text = "[Tasks unavailable]"
-        errors.append(msg)
-
     if not ANTHROPIC_API_KEY:
-        print("\n❌  ANTHROPIC_API_KEY is not set. Cannot generate schedule.")
+        print("❌  ANTHROPIC_API_KEY is not set.")
         sys.exit(1)
 
-    # -- Claude schedule --
-    print("  → Claude: generating your schedule …")
-    generate_schedule(events_text, tasks_text)
+    print("🍎  Fetching your day from iCloud …\n")
 
-    if errors:
-        print("⚠  Some integrations were unavailable:")
-        for e in errors:
-            print(f"   • {e}")
+    try:
+        principal = connect_icloud()
+    except EnvironmentError as exc:
+        print(f"❌  {exc}")
+        sys.exit(1)
+    except Exception as exc:
+        print(f"❌  Could not connect to iCloud: {exc}")
+        sys.exit(1)
+
+    # -- Calendar events --
+    events_text = ""
+    try:
+        print("  → Calendar: fetching events …")
+        events = get_apple_events(principal)
+        events_text = format_events(events)
+        print(f"  → Calendar: {len(events)} event(s) today")
+    except Exception as exc:
+        events_text = "[Calendar unavailable]"
+        print(f"  ⚠  Calendar error: {exc}")
+
+    # -- Reminders --
+    reminders_text = ""
+    try:
+        print("  → Reminders: fetching due items …")
+        reminders = get_apple_reminders(principal)
+        reminders_text = format_reminders(reminders)
+        print(f"  → Reminders: {len(reminders)} item(s) due today")
+    except Exception as exc:
+        reminders_text = "[Reminders unavailable]"
+        print(f"  ⚠  Reminders error: {exc}")
+
+    print("  → Claude: building your plan …")
+    generate_plan(events_text, reminders_text)
 
 
 if __name__ == "__main__":
